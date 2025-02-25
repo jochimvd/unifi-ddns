@@ -3,10 +3,7 @@ import { AAAARecord, ARecord } from 'cloudflare/src/resources/dns/records.js';
 type AddressableRecord = AAAARecord | ARecord;
 
 class HttpError extends Error {
-	constructor(
-		public statusCode: number,
-		message: string,
-	) {
+	constructor(public statusCode: number, message: string) {
 		super(message);
 		this.name = 'HttpError';
 	}
@@ -32,11 +29,11 @@ function constructClientOptions(request: Request): ClientOptions {
 	};
 }
 
-function constructDNSRecord(request: Request): AddressableRecord {
+function constructDNSRecords(request: Request): AddressableRecord[] {
 	const url = new URL(request.url);
 	const params = url.searchParams;
 	let ip = params.get('ip') || params.get('myip');
-	const hostname = params.get('hostname');
+	const hostnames = params.get('hostname');
 
 	if (ip === null || ip === undefined) {
 		throw new HttpError(422, 'The "ip" parameter is required and cannot be empty. Specify ip=auto to use the client IP.');
@@ -47,19 +44,27 @@ function constructDNSRecord(request: Request): AddressableRecord {
 		}
 	}
 
-	if (hostname === null || hostname === undefined) {
+	if (hostnames === null || hostnames === undefined) {
 		throw new HttpError(422, 'The "hostname" parameter is required and cannot be empty.');
 	}
 
-	return {
-		content: ip,
-		name: hostname,
-		type: ip.includes('.') ? 'A' : 'AAAA',
-		ttl: 1,
-	};
+	// Split hostnames by comma
+	const records: AddressableRecord[] = [];
+	for (const hostname of hostnames.split(',')) {
+		const record: AddressableRecord = {
+			content: ip,
+			name: hostname,
+			type: ip.includes('.') ? 'A' : 'AAAA',
+			ttl: 1,
+		};
+
+		records.push(record);
+	}
+
+	return records;
 }
 
-async function update(clientOptions: ClientOptions, newRecord: AddressableRecord): Promise<Response> {
+async function update(clientOptions: ClientOptions, newRecords: AddressableRecord[]): Promise<Response> {
 	const cloudflare = new Cloudflare(clientOptions);
 
 	const tokenStatus = (await cloudflare.user.tokens.verify()).status;
@@ -68,43 +73,44 @@ async function update(clientOptions: ClientOptions, newRecord: AddressableRecord
 	}
 
 	const zones = (await cloudflare.zones.list()).result;
-	if (zones.length > 1) {
-		throw new HttpError(400, 'More than one zone was found! You must supply an API Token scoped to a single zone.');
-	} else if (zones.length === 0) {
+	if (zones.length === 0) {
 		throw new HttpError(400, 'No zones found! You must supply an API Token scoped to a single zone.');
 	}
 
-	const zone = zones[0];
+	for (const newRecord of newRecords) {
+		for (const zone of zones) {
+			const records = (
+				await cloudflare.dns.records.list({
+					zone_id: zone.id,
+					name: newRecord.name as any,
+					type: newRecord.type,
+				})
+			).result;
 
-	const records = (
-		await cloudflare.dns.records.list({
-			zone_id: zone.id,
-			name: newRecord.name as any,
-			type: newRecord.type,
-		})
-	).result;
+			if (records.length > 1) {
+				throw new HttpError(400, 'More than one matching record found!');
+			} else if (records.length === 0 || records[0].id === undefined) {
+				console.log('No record found! You must first manually create the record.');
+				continue;
+			}
 
-	if (records.length > 1) {
-		throw new HttpError(400, 'More than one matching record found!');
-	} else if (records.length === 0 || records[0].id === undefined) {
-		throw new HttpError(400, 'No record found! You must first manually create the record.');
+			// Extract current properties
+			const currentRecord = records[0] as AddressableRecord;
+			const proxied = currentRecord.proxied ?? false; // Default to `false` if `proxied` is undefined
+			const comment = currentRecord.comment;
+
+			await cloudflare.dns.records.update(records[0].id, {
+				content: newRecord.content,
+				zone_id: zone.id,
+				name: newRecord.name as any,
+				type: newRecord.type,
+				proxied, // Pass the existing "proxied" status
+				comment, // Pass the existing "comment"
+			});
+
+			console.log('DNS record for ' + newRecord.name + '(' + newRecord.type + ') updated successfully to ' + newRecord.content);
+		}
 	}
-
-	// Extract current properties
-	const currentRecord = records[0] as AddressableRecord;
-	const proxied = currentRecord.proxied ?? false; // Default to `false` if `proxied` is undefined
-	const comment = currentRecord.comment;
-
-	await cloudflare.dns.records.update(records[0].id, {
-		content: newRecord.content,
-		zone_id: zone.id,
-		name: newRecord.name as any,
-		type: newRecord.type,
-		proxied, // Pass the existing "proxied" status
-		comment, // Pass the existing "comment"
-	});
-
-	console.log('DNS record for ' + newRecord.name + '(' + newRecord.type + ') updated successfully to ' + newRecord.content);
 
 	return new Response('OK', { status: 200 });
 }
@@ -119,10 +125,10 @@ export default {
 		try {
 			// Construct client options and DNS record
 			const clientOptions = constructClientOptions(request);
-			const record = constructDNSRecord(request);
+			const records = constructDNSRecords(request);
 
 			// Run the update function
-			return await update(clientOptions, record);
+			return await update(clientOptions, records);
 		} catch (error) {
 			if (error instanceof HttpError) {
 				console.log('Error updating DNS record: ' + error.message);
